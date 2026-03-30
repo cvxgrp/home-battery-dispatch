@@ -13,7 +13,6 @@ Usage:
 """
 
 import argparse
-import datetime
 import pickle
 from pathlib import Path
 
@@ -26,6 +25,7 @@ from hem.data import load_data, load_forecaster, get_eval_window
 from hem.forecast import (
     train_baseline,
     train_ar_model,
+    predict_ar,
     featurize_baseline,
     AR_LOOKBACK,
     AR_HORIZON,
@@ -34,7 +34,6 @@ from hem.policies import (
     no_storage,
     peak_shaving,
     energy_arbitrage,
-    prescient,
     mpc,
     optimize,
     compute_costs,
@@ -77,25 +76,22 @@ def load_results(name: str) -> dict:
         return pickle.load(f)
 
 
-def train_forecasters():
-    print("Training forecasters...")
+def _train_and_save_forecaster(
+    series: pd.Series,
+    eta: float,
+    lambd: float,
+    csv_path: Path,
+    csv_header: str,
+    ar_path: Path,
+) -> None:
+    """Train baseline + AR model for one time series and save artifacts."""
+    train = series[series.index.year <= 2021]
+    train_len = len(train)
 
-    load_data = pd.read_csv(DATA_DIR / "loads.csv", parse_dates=[0], index_col=0)[
-        "Load (kW)"
-    ]
-    da_price_data = pd.read_csv(
-        DATA_DIR / "da_prices.csv", parse_dates=[0], index_col=0
-    )["DA Price (NOK/kWh)"]
+    theta = train_baseline(train, eta=eta, lambd=lambd)
 
-    load_train = load_data[load_data.index.year <= 2021]
-    price_train = da_price_data[da_price_data.index.year <= 2021]
-
-    load_theta = train_baseline(load_train, tau=0.2, lambd=0.1)
-    price_theta = train_baseline(price_train, tau=0.5, lambd=0.1)
-
-    train_len = len(load_train)
     X_train = np.array([featurize_baseline(t) for t in range(train_len)])
-    train_baseline_load = pd.Series(X_train @ load_theta, index=load_train.index)
+    train_bl = pd.Series(X_train @ theta, index=train.index)
 
     date_range = pd.date_range(
         start="2022-01-01 00:00:00", end="2023-12-31 23:00:00", freq="h"
@@ -103,35 +99,37 @@ def train_forecasters():
     X_ext = np.array(
         [featurize_baseline(train_len + i) for i in range(len(date_range))]
     )
-    ext_baseline = pd.Series(X_ext @ load_theta, index=date_range)
-    load_baseline = pd.concat([train_baseline_load, ext_baseline])
-    load_baseline.to_csv(DATA_DIR / "load_baseline.csv", header=["Baseline load (kW)"])
+    ext_bl = pd.Series(X_ext @ theta, index=date_range)
+    baseline = pd.concat([train_bl, ext_bl])
+    baseline.to_csv(csv_path, header=[csv_header])
 
-    X_train_price = np.array([featurize_baseline(t) for t in range(len(price_train))])
-    train_baseline_price = pd.Series(
-        X_train_price @ price_theta, index=price_train.index
-    )
-    X_ext_price = np.array(
-        [featurize_baseline(len(price_train) + i) for i in range(len(date_range))]
-    )
-    ext_baseline_price = pd.Series(X_ext_price @ price_theta, index=date_range)
-    price_baseline = pd.concat([train_baseline_price, ext_baseline_price])
-    price_baseline.to_csv(
-        DATA_DIR / "da_price_baseline.csv",
-        header=["Baseline day-ahead price (NOK/kWh)"],
-    )
+    residuals = (train - train_bl).values
+    ar_params = train_ar_model(residuals, AR_LOOKBACK, AR_HORIZON, eta=eta, lambd=lambd)
+    pd.to_pickle(ar_params, ar_path)
 
-    load_residuals = (load_train - train_baseline_load).values
-    load_ar_params = train_ar_model(
-        load_residuals, AR_LOOKBACK, AR_HORIZON, tau=0.2, lambd=0.1
-    )
-    pd.to_pickle(load_ar_params, DATA_DIR / "load_AR_params.pkl")
 
-    price_residuals = (price_train - train_baseline_price).values
-    price_ar_params = train_ar_model(
-        price_residuals, AR_LOOKBACK, AR_HORIZON, tau=0.5, lambd=0.1
+def train_forecasters():
+    print("Training forecasters...")
+
+    load_series = pd.read_csv(
+        DATA_DIR / "loads.csv", parse_dates=[0], index_col=0
+    )["Load (kW)"]
+    da_price_series = pd.read_csv(
+        DATA_DIR / "da_prices.csv", parse_dates=[0], index_col=0
+    )["DA Price (NOK/kWh)"]
+
+    _train_and_save_forecaster(
+        load_series, eta=0.2, lambd=0.1,
+        csv_path=DATA_DIR / "load_baseline.csv",
+        csv_header="Baseline load (kW)",
+        ar_path=DATA_DIR / "load_AR_params.pkl",
     )
-    pd.to_pickle(price_ar_params, DATA_DIR / "da_price_AR_params.pkl")
+    _train_and_save_forecaster(
+        da_price_series, eta=0.5, lambd=0.1,
+        csv_path=DATA_DIR / "da_price_baseline.csv",
+        csv_header="Baseline day-ahead price (NOK/kWh)",
+        ar_path=DATA_DIR / "da_price_AR_params.pkl",
+    )
 
 
 def run_baseline(sim: dict) -> None:
@@ -155,7 +153,13 @@ def run_baseline(sim: dict) -> None:
 
 def run_prescient(sim: dict) -> None:
     print("Running prescient...")
-    flows = prescient(sim, solver=cp.GUROBI)
+    flows = optimize(
+        load=sim["load"],
+        tou_prices=sim["tou_prices"],
+        da_prices=sim["da_prices"],
+        datetime_index=sim["datetime_index"],
+        solver=cp.GUROBI,
+    )
     costs = compute_costs(
         sim["tou_prices"], sim["da_prices"], flows["p"], sim["datetime_index"]
     )
@@ -228,7 +232,6 @@ def save_sim_data(sim: dict) -> None:
 
 
 def generate_data_figures(data: dict):
-
     load = data["load"]
     da_prices = data["da_prices"]
 
@@ -252,7 +255,6 @@ def generate_data_figures(data: dict):
 
 
 def generate_forecast_figures(data: dict, forecaster: dict):
-
     load = data["load"]
     da_prices = data["da_prices"]
     load_baseline = forecaster["load_baseline"]
@@ -265,188 +267,132 @@ def generate_forecast_figures(data: dict, forecaster: dict):
     test_prices = da_prices[da_prices.index.year == 2022]
     test_baseline_price = da_price_baseline[da_price_baseline.index.year == 2022]
 
-    plot_baseline_comparison(
-        test_load,
-        test_baseline_load,
-        "2022-01-03",
-        "2022-01-09",
-        "Load (kW)",
-        FIGURES_DIR / "load_baseline_jan.pdf",
-    )
-    plot_baseline_comparison(
-        test_load,
-        test_baseline_load,
-        "2022-06-06",
-        "2022-06-12",
-        "Load (kW)",
-        FIGURES_DIR / "load_baseline_jun.pdf",
-    )
-    plot_baseline_comparison(
-        test_prices,
-        test_baseline_price,
-        "2022-01-10",
-        "2022-01-16",
-        "DA price (NOK/kWh)",
-        FIGURES_DIR / "price_baseline_jan.pdf",
-    )
-    plot_baseline_comparison(
-        test_prices,
-        test_baseline_price,
-        "2022-06-13",
-        "2022-06-19",
-        "DA price (NOK/kWh)",
-        FIGURES_DIR / "price_baseline_jun.pdf",
-    )
+    # Baseline comparison figures
+    for start, end, suffix in [
+        ("2022-01-03", "2022-01-09", "jan"),
+        ("2022-06-06", "2022-06-12", "jun"),
+    ]:
+        plot_baseline_comparison(
+            test_load, test_baseline_load, start, end,
+            "Load (kW)", FIGURES_DIR / f"load_baseline_{suffix}.pdf",
+        )
+        plot_baseline_comparison(
+            test_prices, test_baseline_price,
+            "2022-01-10" if suffix == "jan" else "2022-06-13",
+            "2022-01-16" if suffix == "jan" else "2022-06-19",
+            "DA price (NOK/kWh)", FIGURES_DIR / f"price_baseline_{suffix}.pdf",
+        )
 
     M, L = AR_LOOKBACK, AR_HORIZON
-    test_day = pd.Timestamp(datetime.datetime(2022, 1, 5, 12, 0))
-    past = test_load[test_load.index <= test_day].iloc[-M:]
-    past_baseline = test_baseline_load[test_baseline_load.index <= test_day].iloc[-M:]
-    future = test_load[test_load.index > test_day].iloc[:L]
-    future_baseline = test_baseline_load[test_baseline_load.index > test_day].iloc[:L]
 
-    past_res = past - past_baseline
-    future_res_pred = past_res.values @ load_ar_params
+    # Load forecast figure
+    test_day = pd.Timestamp("2022-01-05 12:00")
+    t = test_load.index.get_loc(test_day)
+    past = test_load.iloc[t - M + 1 : t + 1]
+    future = test_load.iloc[t + 1 : t + 1 + L]
+    future_bl = test_baseline_load.iloc[t + 1 : t + 1 + L]
 
-    plot_forecast_comparison(
-        past.values,
-        future.values,
-        future_baseline.values,
-        future_baseline.values + future_res_pred,
-        past.index,
-        future.index,
-        "Load (kW)",
-        FIGURES_DIR / "load_forecast.pdf",
+    ar_forecast = predict_ar(
+        test_load, test_baseline_load, load_ar_params,
+        t + 1, M, L, load.min(), load.max(),
     )
 
-    test_day_price = pd.Timestamp(datetime.datetime(2022, 5, 12, 12, 0))
-    past_p = test_prices[test_prices.index <= test_day_price].iloc[-M:]
-    past_baseline_p = test_baseline_price[
-        test_baseline_price.index <= test_day_price
-    ].iloc[-M:]
-    future_p = test_prices[test_prices.index > test_day_price].iloc[:L]
-    future_baseline_p = test_baseline_price[
-        test_baseline_price.index > test_day_price
-    ].iloc[:L]
+    plot_forecast_comparison(
+        past.values, future.values, future_bl.values, ar_forecast,
+        past.index, future.index,
+        "Load (kW)", FIGURES_DIR / "load_forecast.pdf",
+    )
 
-    past_res_p = past_p - past_baseline_p
-    future_res_pred_p = past_res_p.values @ da_price_ar_params
-    future_ar_p = future_baseline_p.values + future_res_pred_p
+    # Price forecast figure
+    test_day_price = pd.Timestamp("2022-05-12 12:00")
+    t_p = test_prices.index.get_loc(test_day_price)
+    past_p = test_prices.iloc[t_p - M + 1 : t_p + 1]
+    future_p = test_prices.iloc[t_p + 1 : t_p + 1 + L]
+    future_bl_p = test_baseline_price.iloc[t_p + 1 : t_p + 1 + L]
 
+    ar_forecast_p = predict_ar(
+        test_prices, test_baseline_price, da_price_ar_params,
+        t_p + 1, M, L, da_prices.min(), da_prices.max(),
+    )
+
+    # Account for known day-ahead prices (published at 13:00)
     current_hour = test_day_price.hour
     hours_known = min(
         24 - current_hour if current_hour < 13 else (24 - current_hour) + 24, L
     )
-    future_baseline_adj = future_baseline_p.copy()
-    future_ar_adj = future_ar_p.copy()
-    future_baseline_adj.iloc[:hours_known] = future_p.iloc[:hours_known]
-    future_ar_adj[:hours_known] = future_p.iloc[:hours_known].values
+    future_bl_adj = future_bl_p.copy()
+    ar_forecast_adj = ar_forecast_p.copy()
+    future_bl_adj.iloc[:hours_known] = future_p.iloc[:hours_known]
+    ar_forecast_adj[:hours_known] = future_p.iloc[:hours_known].values
 
     plot_forecast_comparison(
-        past_p.values,
-        future_p.values,
-        future_baseline_adj.values,
-        future_ar_adj,
-        past_p.index,
-        future_p.index,
-        "Day-ahead price (NOK/kWh)",
-        FIGURES_DIR / "price_forecast.pdf",
+        past_p.values, future_p.values, future_bl_adj.values, ar_forecast_adj,
+        past_p.index, future_p.index,
+        "Day-ahead price (NOK/kWh)", FIGURES_DIR / "price_forecast.pdf",
     )
 
 
 def generate_policy_figures(sim_data: dict, prescient_results: dict, mpc_results: dict):
-
     datetime_index = sim_data["datetime_index"]
     load = sim_data["load"]
+    tou_prices = sim_data["tou_prices"]
+    da_prices = sim_data["da_prices"]
 
     z_no_storage = get_z_values(load, datetime_index, N=3)
     tier_lines = [2, 5, 10]
+    capacity = 40.0
 
     plot_load_year(load, datetime_index, FIGURES_DIR / "load_year.pdf")
 
     week_start = datetime_index.get_loc(pd.Timestamp("2022-07-04"))
     week_end = week_start + 24 * 7
     load_week = load[week_start:week_end]
-
-    tou_prices = sim_data["tou_prices"]
-    da_prices = sim_data["da_prices"]
     prices_week = tou_prices[week_start:week_end] + da_prices[week_start:week_end]
 
-    capacity = 40.0
-
-    p_prescient = prescient_results["flows"]["p"]
-    q_prescient = prescient_results["flows"]["q"]
-    z_prescient = get_z_values(p_prescient, datetime_index, N=3)
-
-    p_mpc = mpc_results["mpc"]["flows"]["p"]
-    q_mpc = mpc_results["mpc"]["flows"]["q"]
-    z_mpc = get_z_values(p_mpc, datetime_index, N=3)
-
-    all_power_week = np.concatenate(
-        [load_week, p_prescient[week_start:week_end], p_mpc[week_start:week_end]]
-    )
+    # Compute shared ylim across both policies
+    all_power_week = np.concatenate([
+        load_week,
+        prescient_results["flows"]["p"][week_start:week_end],
+        mpc_results["mpc"]["flows"]["p"][week_start:week_end],
+    ])
     power_ylim = (min(0, all_power_week.min()), all_power_week.max() * 1.05)
 
-    plot_grid_power(
-        p_prescient, datetime_index, tier_lines, FIGURES_DIR / "power_prescient.pdf"
-    )
-    plot_charge_level_year(
-        q_prescient,
-        datetime_index,
-        capacity,
-        FIGURES_DIR / "charge_level_prescient.pdf",
-    )
-    plot_z_comparison(
-        z_no_storage,
-        z_prescient,
-        TIER_THRESHOLDS,
-        ("No storage", "Prescient"),
-        FIGURES_DIR / "peak_avg_prescient.pdf",
-    )
+    policies = [
+        ("prescient", "Prescient", prescient_results["flows"]),
+        ("mpc", "MPC", mpc_results["mpc"]["flows"]),
+    ]
 
-    plot_week_load(
-        load_week, prices_week, FIGURES_DIR / "week_load_prescient.pdf", ylim=power_ylim
-    )
-    plot_week_grid_power(
-        p_prescient[week_start:week_end],
-        prices_week,
-        FIGURES_DIR / "week_power_prescient.pdf",
-        ylim=power_ylim,
-    )
-    plot_week_soc(
-        q_prescient[week_start : week_end + 1],
-        prices_week,
-        FIGURES_DIR / "week_soc_prescient.pdf",
-    )
+    for name, label, flows in policies:
+        p_policy = flows["p"]
+        q_policy = flows["q"]
+        z_policy = get_z_values(p_policy, datetime_index, N=3)
 
-    plot_grid_power(p_mpc, datetime_index, tier_lines, FIGURES_DIR / "power_mpc.pdf")
-    plot_charge_level_year(
-        q_mpc, datetime_index, capacity, FIGURES_DIR / "charge_level_mpc.pdf"
-    )
-    plot_z_comparison(
-        z_no_storage,
-        z_mpc,
-        TIER_THRESHOLDS,
-        ("No storage", "MPC"),
-        FIGURES_DIR / "peak_avg_mpc.pdf",
-    )
-
-    plot_week_load(
-        load_week, prices_week, FIGURES_DIR / "week_load_mpc.pdf", ylim=power_ylim
-    )
-    plot_week_grid_power(
-        p_mpc[week_start:week_end],
-        prices_week,
-        FIGURES_DIR / "week_power_mpc.pdf",
-        ylim=power_ylim,
-    )
-    plot_week_soc(
-        q_mpc[week_start : week_end + 1], prices_week, FIGURES_DIR / "week_soc_mpc.pdf"
-    )
+        plot_grid_power(
+            p_policy, datetime_index, tier_lines, FIGURES_DIR / f"power_{name}.pdf"
+        )
+        plot_charge_level_year(
+            q_policy, datetime_index, capacity,
+            FIGURES_DIR / f"charge_level_{name}.pdf",
+        )
+        plot_z_comparison(
+            z_no_storage, z_policy, TIER_THRESHOLDS,
+            ("No storage", label), FIGURES_DIR / f"peak_avg_{name}.pdf",
+        )
+        plot_week_load(
+            load_week, prices_week,
+            FIGURES_DIR / f"week_load_{name}.pdf", ylim=power_ylim,
+        )
+        plot_week_grid_power(
+            p_policy[week_start:week_end], prices_week,
+            FIGURES_DIR / f"week_power_{name}.pdf", ylim=power_ylim,
+        )
+        plot_week_soc(
+            q_policy[week_start:week_end + 1], prices_week,
+            FIGURES_DIR / f"week_soc_{name}.pdf",
+        )
 
 
 def generate_capacity_figure(capacity_sweep: dict):
-
     capacities = capacity_sweep["capacities"]
     savings_dict = {}
 

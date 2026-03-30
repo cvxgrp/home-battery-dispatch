@@ -26,6 +26,18 @@ TIER_THRESHOLDS = [2, 5, 10, 15, 20]  # kW
 HORIZON = 24 * 30  # Planning horizon (hours)
 
 
+def _enforce_grid_limits(load_t: float, c_t: float, d_t: float):
+    """Clamp grid power to [0, MAX_GRID_POWER], adjusting c/d as needed."""
+    p_t = load_t + c_t - d_t
+    if p_t > MAX_GRID_POWER:
+        c_t = max(0, MAX_GRID_POWER - load_t + d_t)
+        p_t = load_t + c_t - d_t
+    if p_t < 0:
+        d_t = load_t + c_t
+        p_t = 0
+    return p_t, c_t, d_t
+
+
 def energy_cost(
     p: cp.Variable, tou_prices: np.ndarray, da_prices: np.ndarray
 ) -> cp.Expression:
@@ -132,17 +144,13 @@ def compute_costs(
     monthly_da = []
     monthly_peak = []
 
-    for month in pd.unique(datetime_index.month):
-        mask = datetime_index.month == month
+    z_values = get_z_values(power, datetime_index, N)
 
+    for i, month in enumerate(pd.unique(datetime_index.month)):
+        mask = datetime_index.month == month
         monthly_tou.append(np.sum(tou_prices[mask] * power[mask]))
         monthly_da.append(np.sum(da_prices[mask] * power[mask]))
-
-        month_len = sum(mask)
-        daily_peaks = [power[mask][i : i + 24].max() for i in range(0, month_len, 24)]
-        n_largest = sorted(daily_peaks, reverse=True)[:N]
-        z = sum(n_largest) / N
-        monthly_peak.append(compute_peak_power_cost_value(z))
+        monthly_peak.append(compute_peak_power_cost_value(z_values[i]))
 
     return {
         "monthly_tou": monthly_tou,
@@ -277,25 +285,15 @@ def peak_shaving(
 
     for t in range(T):
         if load[t] > target:
-            # Discharge to shave peak, respecting SOC limit
             needed = load[t] - target
             d[t] = min(max_discharge, needed, q[t] * ETA_DISCHARGE)
             c[t] = 0
         else:
-            # Charge if below target, respecting SOC limit
             available = target - load[t]
             c[t] = min(max_charge, available, (capacity - q[t]) / ETA_CHARGE)
             d[t] = 0
 
-        # Compute grid power and enforce limits
-        p[t] = load[t] + c[t] - d[t]
-        if p[t] > MAX_GRID_POWER:
-            c[t] = max(0, MAX_GRID_POWER - load[t] + d[t])
-            p[t] = load[t] + c[t] - d[t]
-        if p[t] < 0:
-            d[t] = load[t] + c[t]
-            p[t] = 0
-
+        p[t], c[t], d[t] = _enforce_grid_limits(load[t], c[t], d[t])
         q[t + 1] = ETA_STORE * q[t] + ETA_CHARGE * c[t] - (1 / ETA_DISCHARGE) * d[t]
 
     return {"p": p, "c": c, "d": d, "q": q}
@@ -326,59 +324,16 @@ def energy_arbitrage(
         hour = datetime_index[t].hour
 
         if hour >= 22 or hour <= 5:
-            # Off-peak: charge
             c[t] = min(max_charge, (capacity - q[t]) / ETA_CHARGE)
             d[t] = 0
         else:
-            # Peak: discharge to offset load (no export)
             d[t] = min(max_discharge, load[t], q[t] * ETA_DISCHARGE)
             c[t] = 0
 
-        # Compute grid power and enforce limits
-        p[t] = load[t] + c[t] - d[t]
-        if p[t] > MAX_GRID_POWER:
-            c[t] = max(0, MAX_GRID_POWER - load[t] + d[t])
-            p[t] = load[t] + c[t] - d[t]
-        if p[t] < 0:
-            d[t] = load[t] + c[t]
-            p[t] = 0
-
+        p[t], c[t], d[t] = _enforce_grid_limits(load[t], c[t], d[t])
         q[t + 1] = ETA_STORE * q[t] + ETA_CHARGE * c[t] - (1 / ETA_DISCHARGE) * d[t]
 
     return {"p": p, "c": c, "d": d, "q": q}
-
-
-def prescient(
-    sim: dict,
-    capacity: float = CAPACITY,
-    include_peak_power: bool = True,
-    peak_power_N: int = 3,
-    solver=cp.GUROBI,
-    verbose: bool = False,
-) -> dict:
-    """Prescient policy: optimize with perfect foresight."""
-    result = optimize(
-        load=sim["load"],
-        tou_prices=sim["tou_prices"],
-        da_prices=sim["da_prices"],
-        datetime_index=sim["datetime_index"],
-        capacity=capacity,
-        max_charge=capacity / 2,
-        max_discharge=capacity / 2,
-        include_peak_power=include_peak_power,
-        peak_power_N=peak_power_N,
-        solver=solver,
-        verbose=verbose,
-    )
-
-    return {
-        "p": result["p"],
-        "c": result["c"],
-        "d": result["d"],
-        "q": result["q"],
-        "cost": result["cost"],
-        "status": result["status"],
-    }
 
 
 def mpc(

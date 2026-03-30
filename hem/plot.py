@@ -166,6 +166,27 @@ def _add_price_overlay(ax, prices: np.ndarray) -> None:
     ax2.grid(False)
 
 
+def _plot_week(
+    values: np.ndarray,
+    prices: np.ndarray,
+    ylabel: str,
+    save_path: str | None = None,
+    ylim: tuple[float, float] | None = None,
+) -> None:
+    """Plot a weekly series with price overlay."""
+    fig, ax = plt.subplots()
+    ax.plot(values, color="#0072B2")
+    ax.set_ylabel(ylabel)
+    if ylim:
+        ax.set_ylim(ylim)
+    ax.set_xticks(np.arange(0, 24 * 7 + 1, 24))
+    ax.set_xticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Mon"])
+    _add_price_overlay(ax, prices)
+    if save_path:
+        plt.savefig(save_path)
+    plt.close()
+
+
 def plot_week_load(
     load: np.ndarray,
     prices: np.ndarray,
@@ -173,20 +194,7 @@ def plot_week_load(
     ylim: tuple[float, float] | None = None,
 ) -> None:
     """Plot load for one week with price overlay."""
-    fig, ax = plt.subplots()
-
-    ax.plot(load, color="#0072B2")
-    ax.set_ylabel("Load (kW)")
-    if ylim:
-        ax.set_ylim(ylim)
-    ax.set_xticks(np.arange(0, 24 * 7 + 1, 24))
-    ax.set_xticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Mon"])
-
-    _add_price_overlay(ax, prices)
-
-    if save_path:
-        plt.savefig(save_path)
-    plt.close()
+    _plot_week(load, prices, "Load (kW)", save_path, ylim)
 
 
 def plot_week_grid_power(
@@ -196,20 +204,7 @@ def plot_week_grid_power(
     ylim: tuple[float, float] | None = None,
 ) -> None:
     """Plot grid power for one week with price overlay."""
-    fig, ax = plt.subplots()
-
-    ax.plot(grid_power, color="#0072B2")
-    ax.set_ylabel("Grid power (kW)")
-    if ylim:
-        ax.set_ylim(ylim)
-    ax.set_xticks(np.arange(0, 24 * 7 + 1, 24))
-    ax.set_xticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Mon"])
-
-    _add_price_overlay(ax, prices)
-
-    if save_path:
-        plt.savefig(save_path)
-    plt.close()
+    _plot_week(grid_power, prices, "Grid power (kW)", save_path, ylim)
 
 
 def plot_week_soc(
@@ -218,18 +213,7 @@ def plot_week_soc(
     save_path: str | None = None,
 ) -> None:
     """Plot charge level for one week with price overlay."""
-    fig, ax = plt.subplots()
-
-    ax.plot(q_storage, color="#0072B2")
-    ax.set_ylabel("Charge level (kWh)")
-    ax.set_xticks(np.arange(0, 24 * 7 + 1, 24))
-    ax.set_xticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Mon"])
-
-    _add_price_overlay(ax, prices)
-
-    if save_path:
-        plt.savefig(save_path)
-    plt.close()
+    _plot_week(q_storage, prices, "Charge level (kWh)", save_path)
 
 
 def plot_z_comparison(
