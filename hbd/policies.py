@@ -5,7 +5,7 @@ import pandas as pd
 import cvxpy as cp
 from tqdm import trange
 
-from hem.forecast import make_load_forecast, make_price_forecast
+from hbd.forecast import make_load_forecast, make_price_forecast
 
 # Storage parameters
 CAPACITY = 40  # Storage capacity (kWh)
@@ -21,6 +21,14 @@ ETA_DISCHARGE = 0.95  # Discharging efficiency
 # Peak power tariff tiers (Norway)
 TIER_COSTS = [83, 147, 252, 371, 490]  # NOK per month
 TIER_THRESHOLDS = [2, 5, 10, 15, 20]  # kW
+
+# Seasonal peak-shaving targets (kW), one per month. Summer at tier 1
+# (low loads), shoulder at tier 2, winter at tier 3.
+SEASONAL_PEAK_TARGETS = {
+    1: 10, 2: 10, 12: 10,           # winter: tier 3
+    3: 5, 4: 5, 10: 5, 11: 5,       # shoulder: tier 2
+    5: 2, 6: 2, 7: 2, 8: 2, 9: 2,   # summer: tier 1
+}
 
 # MPC parameters
 HORIZON = 24 * 30  # Planning horizon (hours)
@@ -206,13 +214,11 @@ def optimize(
     q_init = q_init if q_init is not None else capacity / 2
     q_final = q_final if q_final is not None else capacity / 2
 
-    # Variables
     p = cp.Variable(T, nonneg=True)
     c = cp.Variable(T, nonneg=True)
     d = cp.Variable(T, nonneg=True)
     q = cp.Variable(T + 1, nonneg=True)
 
-    # Constraints
     constraints = [
         p <= MAX_GRID_POWER,
         load + c == p + d,
@@ -224,10 +230,7 @@ def optimize(
         d <= max_discharge,
     ]
 
-    # Objective: energy cost
     objective = energy_cost(p, tou_prices, da_prices)
-
-    # Add peak power cost if requested
     if include_peak_power:
         pp_cost, pp_constraints, _ = peak_power_cost(
             p, datetime_index, peak_power_N, p_prev, datetime_index_prev
@@ -235,7 +238,6 @@ def optimize(
         objective += pp_cost
         constraints += pp_constraints
 
-    # Solve
     problem = cp.Problem(cp.Minimize(objective), constraints)
     problem.solve(verbose=verbose, solver=solver)
 
@@ -265,17 +267,20 @@ def no_storage(sim: dict) -> dict:
 def peak_shaving(
     sim: dict,
     capacity: float = CAPACITY,
-    target: float = 5.0,
+    seasonal_targets: dict[int, float] | None = None,
 ) -> dict:
-    """Shave peaks above target power level.
+    """Shave peaks above a month-specific target level.
 
-    Discharge when load exceeds target, charge when below (if battery not full).
-    Target of 5 kW corresponds to tier 2 threshold.
+    Discharge when the load exceeds the target, charge when below. The
+    default per-month targets are in SEASONAL_PEAK_TARGETS.
     """
     T = sim["T"]
     load = sim["load"]
+    datetime_index = sim["datetime_index"]
     max_charge = capacity / 2
     max_discharge = capacity / 2
+    if seasonal_targets is None:
+        seasonal_targets = SEASONAL_PEAK_TARGETS
 
     p = np.zeros(T)
     c = np.zeros(T)
@@ -284,6 +289,7 @@ def peak_shaving(
     q[0] = capacity / 2
 
     for t in range(T):
+        target = seasonal_targets[datetime_index[t].month]
         if load[t] > target:
             needed = load[t] - target
             d[t] = min(max_discharge, needed, q[t] * ETA_DISCHARGE)
@@ -299,20 +305,37 @@ def peak_shaving(
     return {"p": p, "c": c, "d": d, "q": q}
 
 
+def _daily_price_thresholds(
+    prices: np.ndarray,
+    datetime_index: pd.DatetimeIndex,
+) -> np.ndarray:
+    """Compute per-day price thresholds (median of the current day's prices).
+
+    Returns an array of the same length as prices, where each entry is the
+    median price for the day of that timestamp.
+    """
+    s = pd.Series(prices, index=datetime_index)
+    return s.groupby(s.index.date).transform("median").values
+
+
 def energy_arbitrage(
     sim: dict,
     capacity: float = CAPACITY,
 ) -> dict:
-    """Charge during off-peak hours, discharge during peak hours to offset load.
+    """Price-based energy arbitrage with a daily median threshold.
 
-    Off-peak: 22:00-05:00 (charge)
-    Peak: 06:00-21:00 (discharge to offset load, no export)
+    Each day, the threshold is the median of that day's prices. Charge
+    when the current price is below the threshold; discharge against the
+    load (no export) when above. Clipped to charge-level and rate limits.
     """
     T = sim["T"]
     load = sim["load"]
     datetime_index = sim["datetime_index"]
+    prices = sim["tou_prices"] + sim["da_prices"]
     max_charge = capacity / 2
     max_discharge = capacity / 2
+
+    thresholds = _daily_price_thresholds(prices, datetime_index)
 
     p = np.zeros(T)
     c = np.zeros(T)
@@ -321,10 +344,54 @@ def energy_arbitrage(
     q[0] = capacity / 2
 
     for t in range(T):
-        hour = datetime_index[t].hour
-
-        if hour >= 22 or hour <= 5:
+        if prices[t] < thresholds[t]:
             c[t] = min(max_charge, (capacity - q[t]) / ETA_CHARGE)
+            d[t] = 0
+        else:
+            d[t] = min(max_discharge, load[t], q[t] * ETA_DISCHARGE)
+            c[t] = 0
+
+        p[t], c[t], d[t] = _enforce_grid_limits(load[t], c[t], d[t])
+        q[t + 1] = ETA_STORE * q[t] + ETA_CHARGE * c[t] - (1 / ETA_DISCHARGE) * d[t]
+
+    return {"p": p, "c": c, "d": d, "q": q}
+
+
+def capped_arbitrage(
+    sim: dict,
+    capacity: float = CAPACITY,
+    seasonal_targets: dict[int, float] | None = None,
+) -> dict:
+    """Price-based arbitrage with the grid draw capped at a seasonal tier.
+
+    Same rule as energy_arbitrage, but charging is additionally clipped so
+    that the grid draw l_t + c_t never exceeds the seasonal target kappa_m.
+    """
+    T = sim["T"]
+    load = sim["load"]
+    datetime_index = sim["datetime_index"]
+    prices = sim["tou_prices"] + sim["da_prices"]
+    max_charge = capacity / 2
+    max_discharge = capacity / 2
+    if seasonal_targets is None:
+        seasonal_targets = SEASONAL_PEAK_TARGETS
+
+    thresholds = _daily_price_thresholds(prices, datetime_index)
+
+    p = np.zeros(T)
+    c = np.zeros(T)
+    d = np.zeros(T)
+    q = np.zeros(T + 1)
+    q[0] = capacity / 2
+
+    for t in range(T):
+        target = seasonal_targets[datetime_index[t].month]
+        if prices[t] < thresholds[t]:
+            c[t] = min(
+                max_charge,
+                (capacity - q[t]) / ETA_CHARGE,
+                max(0, target - load[t]),
+            )
             d[t] = 0
         else:
             d[t] = min(max_discharge, load[t], q[t] * ETA_DISCHARGE)
@@ -381,7 +448,6 @@ def mpc(
     max_charge = capacity / 2
     max_discharge = capacity / 2
 
-    # Initialize arrays
     p_mpc = np.zeros(T)
     c_mpc = np.zeros(T)
     d_mpc = np.zeros(T)
@@ -394,11 +460,10 @@ def mpc(
     iterator = trange(T) if progress else range(T)
 
     for t in iterator:
-        # Reset p_prev on month boundary
+        # Peak power charge resets each month.
         if datetime_index[t].month != prev_month:
             p_prev = []
 
-        # Generate forecasts
         abs_t = start_idx + t
         load_forecast = make_load_forecast(
             load_data, load_baseline, load_ar_params, abs_t, horizon
@@ -408,14 +473,12 @@ def mpc(
         )
         tou_price_forecast = tou_price_data.iloc[abs_t : abs_t + horizon].values
 
-        # Datetime indices
         horizon_index = load_baseline.index[abs_t : abs_t + horizon]
         curr_month = datetime_index[t].month
         prev_index = datetime_index[
             (datetime_index.month == curr_month) & (datetime_index < datetime_index[t])
         ]
 
-        # Solve MPC problem
         result = optimize(
             load=load_forecast,
             tou_prices=tou_price_forecast,
@@ -434,7 +497,7 @@ def mpc(
             verbose=verbose,
         )
 
-        # Execute first action
+        # Apply only the first control action (rolling horizon).
         p_mpc[t] = result["p"][0]
         c_mpc[t] = result["c"][0]
         d_mpc[t] = result["d"][0]

@@ -1,7 +1,7 @@
-# Home Energy Management under Tiered Peak Power Charges
+# Home Battery Dispatch under a Tiered Peak Power Tariff
 
 Code and data to replicate all results in the
-[paper](https://web.stanford.edu/~boyd/papers/hem.html).
+[paper](https://web.stanford.edu/~boyd/papers/hbd.html).
 
 ## Setup
 
@@ -37,7 +37,7 @@ Results are saved to `results/`, figures to `figures/`.
 
 ```bibtex
 @misc{perezpineiro2026home,
-    title         = {Home Energy Management under Tiered Peak Power Charges},
+    title         = {Home Battery Dispatch under a Tiered Peak Power Tariff},
     author        = {David P\'erez-Pi\~neiro and Sigurd Skogestad and Stephen Boyd},
     year          = {2026},
     eprint        = {2307.07580},

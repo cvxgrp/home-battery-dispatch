@@ -21,8 +21,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from hem.data import load_data, load_forecaster, get_eval_window
-from hem.forecast import (
+from hbd.data import load_data, load_forecaster, get_eval_window
+from hbd.forecast import (
     train_baseline,
     train_ar_model,
     predict_ar,
@@ -30,17 +30,18 @@ from hem.forecast import (
     AR_LOOKBACK,
     AR_HORIZON,
 )
-from hem.policies import (
+from hbd.policies import (
     no_storage,
     peak_shaving,
     energy_arbitrage,
+    capped_arbitrage,
     mpc,
     optimize,
     compute_costs,
     get_z_values,
     TIER_THRESHOLDS,
 )
-from hem.plot import (
+from hbd.plot import (
     latexify,
     plot_cost_vs_capacity,
     plot_z_comparison,
@@ -140,6 +141,7 @@ def run_baseline(sim: dict) -> None:
         ("no_storage", no_storage),
         ("peak_shaving", peak_shaving),
         ("energy_arbitrage", energy_arbitrage),
+        ("capped_arbitrage", capped_arbitrage),
     ]:
         flows = policy(sim)
         costs = compute_costs(
