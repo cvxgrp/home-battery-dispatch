@@ -1,7 +1,7 @@
 # Home Battery Dispatch under a Tiered Peak Power Tariff
 
-Code and data to replicate all results in the
-[paper](https://web.stanford.edu/~boyd/papers/hbd.html).
+Code and data to replicate all results in
+[Home Battery Dispatch under a Tiered Peak Power Tariff](https://arxiv.org/pdf/2307.07580).
 
 ## Setup
 
