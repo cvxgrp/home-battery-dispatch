@@ -336,7 +336,7 @@ wheels = [
 ]
 
 [[package]]
-name = "home-energy-management"
+name = "home-battery-dispatch"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
